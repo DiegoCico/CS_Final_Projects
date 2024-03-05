@@ -34,7 +34,7 @@ public final class App {
             System.out.println("Q for quit");
             // Process user input
             userInput = in.nextLine();
-            if (userInput.equalsIgnoreCase("q")) {
+            if ("q".equalsIgnoreCase(userInput)) {
                 break;
             }
 
@@ -44,7 +44,7 @@ public final class App {
                     ip.colorColumnRed(col);
                     ip.exportImage("src/img/process/newImg.png");
                     System.out.println("Would you like to remove it? (d for yes)");
-                    if (in.nextLine().toLowerCase().equals("d")) {
+                    if ("d".equals(in.nextLine().toLowerCase())) {
                         ip.removeSpecificCol(col);
                         ip.exportImage("src/img/output/newImg.png");
                     }
@@ -54,7 +54,7 @@ public final class App {
                     ip.colorColumnRed(random);
                     ip.exportImage("src/img/process/newImg.png");
                     System.out.println("Would you like to remove it? (d for yes)");
-                    if (in.nextLine().toLowerCase().equals("d")) {
+                    if ("d".equals(in.nextLine().toLowerCase())) {
                         ip.removeSpecificCol(random);
                         ip.exportImage("src/img/output/newImg.png");
                     }
