@@ -1,0 +1,5 @@
+isMoveLegal(0, 0)
+placeCard(0, 0, RedCard1: 1 2 3 4 RED)
+checkWinCondition
+isGameOver
+switchTurns
