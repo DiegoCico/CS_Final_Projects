@@ -1,0 +1,172 @@
+---
+title: "Analyze Incidents & Flights"
+author: "Sarah Taylor, Diego Cicotoste"
+date: "Summer I 2025"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+subtitle: CS3200 Final Project
+---
+
+``` {r setup, eval = T, warning = F, echo = F}
+library(kableExtra)
+library(DBI)
+library(RSQLite)
+
+# Open the connection to the database
+conn <- dbConnect(
+RMySQL::MySQL(),
+user = "avnadmin",
+password = "AVNS_C18DfZKwt6EZpZbhpOv",
+dbname = "defaultdb",
+host = "mysql-377c8670-northeastern-d772.d.aivencloud.com",
+port = 23993,
+)
+
+
+```
+
+## Analysis by Month
+``` {r analysisByMonth, eval = T, warning = F, echo = F}
+# SQL Query to get the number of monthly incidents
+monthly_incidents <- dbGetQuery(
+conn,
+"SELECT
+    MONTH(date) AS month_num,
+    MONTHNAME(date) AS month_name,
+    incident_type,
+    COUNT(*) AS incident_count
+  FROM Incidents
+  GROUP BY month_num, month_name, incident_type
+  ORDER BY month_num, incident_type
+"
+)
+
+# Creating the dataframe
+months <- c(
+"January",
+"February",
+"March",
+"April",
+"May",
+"June",
+"July",
+"August",
+"September",
+"October",
+"November",
+"December"
+)
+
+incident_types <- unique(monthly_incidents$incident_type)
+
+incidents_df <- data.frame(Month = months)
+for (t in incident_types) {
+# Initialize each value to 0
+incidents_df[[t]] <- 0
+}
+
+# For each row in the monthly incidents table
+for (i in 1:nrow(monthly_incidents)) {
+month <- monthly_incidents$month_name[i]
+type <- monthly_incidents$incident_type[i]
+count <- monthly_incidents$incident_count[i]
+
+idx <- match(month, incidents_df$Month)
+incidents_df[idx, type] <- count
+}
+
+
+incidents_df %>%
+kable("latex", align = "c") %>%
+kable_styling(bootstrap_options = c("striped", "condensed"),
+position = "center", latex_options = "HOLD_position")
+
+```
+
+
+## Analysis by Airline
+``` {r analysisByAirline, eval = T, warning = F, echo = F}
+
+# SQL to create a view called airline_summary containing the avg delay (rounded to 
+# 2 decimals), and the total number of incidents
+# Surround with invisible to suppress presence in knitted pdf
+invisible(dbExecute(conn, "
+  CREATE OR REPLACE VIEW airline_summary AS
+  SELECT 
+    f.airline,
+    COUNT(*) AS total_incidents,
+    ROUND(AVG(i.delay_mins), 2) AS avg_delay_minutes
+  FROM Incidents i
+  JOIN Flights f ON i.flight_number = f.flight_number
+  GROUP BY f.airline
+"))
+
+# Get the airline summary
+airline_summary <- dbGetQuery(conn, "SELECT * FROM airline_summary")
+
+# Present the airline summer in a table through kable
+airline_summary %>%
+  kable("latex", caption = "Incident Summary by Airline",
+        col.names = c("Airline", "Total Incidents", "Avg. Delay (min)"),
+        align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                position = "center", latex_options = "HOLD_position")
+
+
+```
+
+
+## Trend by Year
+``` {r trendByYear, eval = T, warning = F, echo = F}
+
+# Create a view that contains the year to easily extract in the 2nd step
+# Surround it with 'invisible' to suppress output for the knitted pdf
+invisible(dbExecute(conn, "DROP VIEW IF EXISTS IncidentYears"))
+
+# Select the year substring of date, which will be indices 1-4, since the
+# format of the dates is YYYY-MM-DD
+invisible(dbExecute(conn, "CREATE VIEW IncidentYears AS
+SELECT *, SUBSTRING(date, 1, 4) AS year
+FROM 
+  Incidents;
+"))
+
+# Extract the year 
+yearly_counts <- dbGetQuery(conn, "SELECT year, COUNT(*) AS num_incidents
+FROM 
+  IncidentYears
+GROUP BY 
+  year
+ORDER BY 
+  year;")
+
+# Convert the yearly_counts year to be a number, so that we can sort it for
+# the line chart
+yearly_counts$year <- as.numeric(yearly_counts$year)
+yearly_counts <- yearly_counts[order(yearly_counts$year), ]
+
+# Use the plot function in r to plot the data
+plot(
+  x = yearly_counts$year,
+  y = yearly_counts$num_incidents,
+  type = "o",
+  col = "black",
+  xlab = "Year",
+  ylab = "Number of Incidents",
+  main = "Yearly Incident Counts"
+)
+
+
+```
+
+``` {r disconnectDB, eval = T, warning = F, echo = F}
+
+# Disconnect from the database
+# Surround with invisible to suppress presence in knitted pdf
+invisible(dbDisconnect(conn))
+
+
+```
+
