@@ -1,0 +1,617 @@
+#!/usr/bin/env -S python3 -u
+import argparse
+import socket
+import sys
+import time
+import select
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, CNAME, TXT, MX, NS, SOA
+
+def now():
+    """
+    returns the timestamp
+
+    Returns:
+        int: current time
+    """
+    return int(time.time())
+
+class DNSCache:
+    """
+    DNS class to respond to cache with TTL
+    """
+
+    def __init__(self):
+        self.store = {} # dict that maps (name, query type) to record
+
+    def get(self, name, qtype):
+        """
+        get the cach records that are still valid 
+
+        Args:
+            name: DNS name.
+            qtype: query type.
+
+        Returns:
+            list or None: list of records or None
+        """
+        key = (name.lower(), qtype) # setting the key to map
+        if key not in self.store:
+            return None
+
+        # getting the key from the store
+        entry = self.store[key]
+        # if time is not valid then remove it 
+        if now() > entry["expires"]: 
+            del self.store[key]
+            return None
+        
+        return entry["records"]
+
+    def put(self, name, qtype, records, ttl):
+        """
+        add the records to the store
+
+        Args:
+            name: DNS name.
+            qtype: DNS query type.
+            records: list of records.
+            ttl: TTL in seconds.
+        """
+        key = (name.lower(), qtype) # setting the key for map
+        # adding the key
+        self.store[key] = {
+            "records": records,
+            "expires": now() + ttl
+        }
+
+class Zone:
+    """
+    gets and manages DNS zones
+    """
+
+    def __init__(self, zone_file):
+        with open(zone_file, "r") as f:
+            text = f.read()
+
+        self.records = list(RR.fromZone(text)) # zones in records
+        self.default_ttl = self.records[0].ttl if self.records else 300 # TTL of zone
+
+        # get the domain
+        self.domain = ""
+        for rr in self.records:
+            if rr.rtype == QTYPE.SOA:
+                self.domain = str(rr.rname).rstrip('.').lower()
+                break
+
+    def in_domain(self, name):
+        """
+        Check if name is under a authoritative domain.
+
+        Args:
+            name: DNS name.
+
+        Returns:
+            True if name ends with zone domain.
+        """
+        return name.lower().endswith(self.domain)
+
+    def lookup(self, name, qtype):
+        """
+        Find the records that is matching the name and the type
+
+        Args:
+            name: DNS name.
+            qtype: query type.
+
+        Returns:
+            list: matching resource records.
+        """
+        name = name.rstrip('.').lower() # getting name
+        out = [] # list of the rr
+        for rr in self.records:
+            if str(rr.rname).rstrip('.').lower() == name:
+                if rr.rtype == qtype:
+                    out.append(rr)
+        return out
+
+class Server:
+    def __init__(self, root_ip, zone_file, port):
+        """
+        Initialize server with root IP, zone file, and bind port.
+
+        Args:
+            root_ip (str): root DNS server IP.
+            zone_file (str): path to zone file.
+            port (int): bind port (0 = auto-assign).
+
+        Returns:
+            None
+        """
+        self.root_ip = root_ip # root ip 
+        self.zone = Zone(zone_file) # look through the zone file
+        self.cache = DNSCache() # cache for the queries
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # socket
+        self.sock.bind(("0.0.0.0", port)) # accecible for all 
+        self.port = self.sock.getsockname()[1] # saving hte port
+
+        self.log(f"Bound to port {self.port}")
+
+    def log(self, msg):
+        """
+        debug logs
+
+        Args:
+            msg: log message.
+        """
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+
+    def send_dns(self, dns, addr):
+        """
+        Send DNS to client.
+
+        Args:
+            dns: response
+            addr: (ip, port)
+        """
+        self.sock.sendto(dns.pack(), addr)
+
+    def recv_one(self):
+        """
+        Receive one DNS query from socket.
+
+        Returns:
+            (DNSRecord, (ip,port))
+        """
+        data, addr = self.sock.recvfrom(65535) # receve the data in 65535
+        req = DNSRecord.parse(data) # parse over the data
+        return req, addr
+
+    def handle_query(self, req, addr):
+        """
+        handles one client DNS request
+
+        Args:
+            req: DNS query.
+            addr: client address.
+        """
+        try:
+            q = req.questions[0] # getting the fiest query     
+            qname = str(q.qname).rstrip('.') # get the domain name 
+            if qname == "":
+                qname = "."
+            qtype = q.qtype # get the query type   
+            rd = req.header.rd  # see if it is recursive  
+
+            # Check if the query belongs to a authoritative zone
+            if self.zone.in_domain(qname):
+                resp = self.answer_authoritative(req) # create response
+                self.send_dns(resp, addr)     
+                return
+
+            # recursion requested
+            if rd == 0:
+                resp = req.reply()
+                resp.header.rcode = 2  
+                self.send_dns(resp, addr)
+                return
+
+            # looking for cache
+            cached = self.cache.get(qname, qtype)
+            if cached:
+                # Build response with correct TTL and glue
+                resp = req.reply()
+                resp.header.aa = 0
+                resp.header.ra = 1
+
+                for rr in cached:
+                    resp.add_answer(rr)
+
+                # try to include glue if NS exists
+                if cached and cached[0].rtype == QTYPE.NS:
+                    ns_target = str(cached[0].rdata.label).rstrip('.')
+                    glue = self.cache.get(ns_target, QTYPE.A)
+                    if glue:
+                        for g in glue:
+                            resp.add_ar(g)
+
+                self.send_dns(resp, addr)
+                return
+
+            
+            # Look up the answer by asking other DNS servers
+            result = self.recursive_resolve(qname, qtype)
+            resp = req.reply()         
+
+            if not result:
+                resp.header.rcode = 3
+                resp.header.aa = 0
+                self.send_dns(resp, addr)    
+                return
+            
+            # Copy full message
+            for rr in result.rr:
+                resp.add_answer(rr)
+
+            for rr in result.ar:
+                resp.add_ar(rr)
+
+            # add NS
+            for rr in result.auth:
+                resp.add_auth(rr)
+
+
+            resp.header.aa = 0
+            resp.header.ra = 1
+
+            self.send_dns(resp, addr)
+        except Exception as e:
+            self.log(f"handling query got an error: {e}")
+            try:
+                resp = req.reply()
+                resp.header.rcode = 2
+                self.send_dns(resp, addr) # trying to send it with rcode 2
+            except:
+                pass     
+
+    def answer_authoritative(self, req):
+        """
+        Create a authoritative answer
+
+        Args:
+            req: client query.
+
+        Returns:
+            resp: response packet.
+        """
+        q = req.questions[0] # getting the first query
+        qname = str(q.qname).rstrip('.') # getting the name
+        qtype = q.qtype # etting the type
+
+        resp = req.reply()
+        resp.header.aa = 1
+
+        matches = self.zone.lookup(qname, qtype)
+
+        # CNAME fallback if no matches found
+        if not matches:
+            cname_rrs = self.zone.lookup(qname, QTYPE.CNAME)
+            if cname_rrs:
+                for rr in cname_rrs:
+                    resp.add_answer(rr)
+                target = str(cname_rrs[0].rdata.label).rstrip('.')
+                a_rrs = self.zone.lookup(target, QTYPE.A)
+                for rr in a_rrs:
+                    resp.add_answer(rr)
+
+                # Add SOA authority
+                soa = self.zone.lookup(self.zone.domain, QTYPE.SOA)
+                for s in soa:
+                    resp.add_auth(s)
+                return resp
+
+        # if matches found include it in resp
+        if matches:
+            for rr in matches:
+                resp.add_answer(rr)
+
+            if qtype == QTYPE.NS:
+                for rr in matches:
+                    ns_target = str(rr.rdata.label).rstrip('.')
+                    a_glue = self.zone.lookup(ns_target, QTYPE.A)
+                    for g in a_glue:
+                        resp.add_ar(g)
+                return resp
+
+            # always give authority if not NS
+            soa = self.zone.lookup(self.zone.domain, QTYPE.SOA)
+            for s in soa:
+                resp.add_auth(s)
+            return resp
+
+        # domain must include SOA authority
+        resp.header.rcode = 3  
+        soa = self.zone.lookup(self.zone.domain, QTYPE.SOA)
+        for s in soa:
+            resp.add_auth(s)
+        return resp
+
+    def recursive_resolve(self, qname, qtype, depth=0):
+        """
+        Fix a DNS name recursively
+
+        Args:
+            qname: domain name.
+            qtype: query type.
+            depth: recursion depth (to prevent infinite loops)
+
+        Returns:
+            list or None: fixed records or None if it failed.
+        """
+        if depth > 10:
+            self.log(f"depth is 10 returning none for {qname}")
+            return None
+            
+        server_ip = self.root_ip
+        max_iterations = 20
+        iterations = 0
+
+        # Loop until we get an answer or fail
+        while iterations < max_iterations:
+            iterations += 1
+            
+            # query the DNS server for the name and type
+            ans = self.query_server(server_ip, qname, qtype)
+            if not ans:
+                return None
+
+            # make sure it is bailiwick
+            before_count = len(ans.rr)
+            before_ar = len(ans.ar)
+            ans = self.filter_bailiwick(ans, qname)
+            after_count = len(ans.rr)
+            after_ar = len(ans.ar)
+            
+            # if all answers were filted out bc of baliwick
+            if ((before_count > 0 and after_count == 0) or (before_ar > after_ar)) and len(ans.auth) == 0:
+                return ans
+
+            # Cache everything we find
+            for section in [ans.rr, ans.auth, ans.ar]:
+                for rr in section:
+                    self.cache.put(str(rr.rname).rstrip('.'), rr.rtype, [rr], rr.ttl)
+
+            # found records
+            if ans.rr:
+                # check if the record is NS apply glue
+                if ans.rr[0].rtype == QTYPE.NS:
+                    ns_target = str(ans.rr[0].rdata.label).rstrip('.')
+                    glue = self.recursive_resolve(ns_target, QTYPE.A, depth + 1)
+                    if glue:
+                        for g in glue.rr:
+                            self.cache.put(str(g.rname).rstrip('.'), g.rtype, [g], g.ttl)
+                            ans.ar.append(g)
+                
+                # Check if we got a CNAME 
+                elif ans.rr[0].rtype == QTYPE.CNAME and qtype != QTYPE.CNAME:
+                    # Follow the CNAME chain
+                    cname_target = str(ans.rr[0].rdata.label).rstrip('.')
+                    cname_result = self.recursive_resolve(cname_target, qtype, depth + 1)
+                    if cname_result and cname_result.rr:
+                        # Add the CNAME target's records to our answer
+                        for rr in cname_result.rr:
+                            ans.rr.append(rr)
+
+                return ans  
+
+
+            # look for refferal
+            ns_name = None
+            for rr in ans.auth:
+                if rr.rtype == QTYPE.NS:
+                    # getting the referred domain name
+                    ns_name = str(rr.rdata.label).rstrip('.')
+                    break
+
+            # No refferal found return none
+            if not ns_name:
+                return None
+            
+            # check if the referral matches the query
+            if qtype == QTYPE.NS:
+                referral_domain = None
+                for rr in ans.auth:
+                    if rr.rtype == QTYPE.NS:
+                        referral_domain = str(rr.rname).rstrip('.').lower()
+                        break
+                
+                if referral_domain and referral_domain == qname.lower():
+                    # Move NS records from authority to answer
+                    for rr in ans.auth:
+                        if rr.rtype == QTYPE.NS:
+                            ans.rr.append(rr)
+                    ans.auth = []
+                    # return referal
+                    return ans 
+
+            # Check for a A record in additional
+            g_ip = None
+            for rr in ans.ar:
+                if rr.rtype == QTYPE.A and str(rr.rname).rstrip('.') == ns_name:
+                    g_ip = str(rr.rdata).rstrip('.')
+                    break
+
+            if not g_ip:
+                # no record find resolve it recursively
+                a_rrs = self.recursive_resolve(ns_name, QTYPE.A, depth + 1)
+                if not a_rrs or not a_rrs.rr:
+                    return None  # not able to resulve it return None
+                g_ip = str(a_rrs.rr[0].rdata).rstrip('.')
+
+            # set the  IP to the referred domain 
+            server_ip = g_ip
+        
+        return None
+
+    def query_server(self, ip, qname, qtype):
+        """
+        Send one query to an server on port 60053.
+
+        Args:
+            ip: server IP.
+            qname: name to resolve.
+            qtype: query type.
+
+        Returns:
+            DNSRecord or None: parsed response or None if it faield
+        """
+        q = DNSRecord.question(qname, QTYPE[qtype])
+
+        packet = q.pack()
+
+        max_retries = 5  # including a retry system for pakcet loss
+        result = None
+        
+        for attempt in range(max_retries):
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(3)  # not overload the system
+                s.sendto(packet, (ip, 60053))
+                data, _ = s.recvfrom(65535)
+                result = DNSRecord.parse(data)
+                break
+            except socket.timeout:
+                if attempt >= max_retries - 1:
+                    result = None
+                continue
+            except Exception as e:
+                if attempt >= max_retries - 1:
+                    result = None
+                    break
+                continue
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except:
+                        pass
+        
+        return result
+
+    def is_subdomain(self, name, domain):
+        """
+        Check whether a DNS name is a subdomain of a domain.
+
+        Args:
+            name: The DNS name to check.
+            domai: The domain to compare against.
+
+        Returns:
+        True if name is the same as domain otherwise false
+        """
+        name = name.lower().rstrip('.')
+        domain = domain.lower().rstrip('.')
+        # if domain is empty
+        if domain == '': 
+            return True
+        # if it is the same name
+        return name == domain or name.endswith('.' + domain)
+
+    def get_bailiwick_from_query(self, qname, resp):
+        """
+        find out the bailiwick domain from a DNS query and response.
+
+        Args:
+            qname: The queried DNS name.
+            resp: The DNS response that has answer and authority sections.
+
+        Returns:
+            The bailiwick domain in lowercase
+        """
+        qname = qname.lower().rstrip('.')
+        
+        # Check authority section for NS records
+        for rr in resp.auth:
+            if rr.rtype == QTYPE.NS:
+                return str(rr.rname).rstrip('.').lower()
+        
+        # Check answer section for NS records
+        for rr in resp.rr:
+            if rr.rtype == QTYPE.NS:
+                return str(rr.rname).rstrip('.').lower()
+        
+        parts = qname.split('.')
+        # Try to find the zone by checking shorter suffixes
+        for i in range(len(parts)):
+            potential_zone = '.'.join(parts[i:])
+            # Check if any answer is under this zone
+            for rr in resp.rr:
+                rname = str(rr.rname).rstrip('.').lower()
+                if self.is_subdomain(rname, potential_zone):
+                    return potential_zone
+        
+        # if no match is found use query parent as bailiwick
+        if len(parts) >= 2:
+            return '.'.join(parts[-2:])
+        
+        return qname
+
+    def filter_bailiwick(self, resp, qname):
+        """
+        Filter response to only include in-bailiwick records.
+        
+        Args:
+            resp: DNS response
+            qname: original query name
+            
+        Returns:
+            Filtered response
+        """
+        keep_ans = []
+        keep_auth = []
+        keep_add = []
+
+        # Determine the bailiwick domain
+        bailiwick_domain = self.get_bailiwick_from_query(qname, resp)
+
+        # Filter answer records 
+        for rr in resp.rr:
+            rname = str(rr.rname).rstrip('.').lower()
+            if bailiwick_domain:
+                # For answer section, the record name must be in bailiwick
+                if self.is_subdomain(rname, bailiwick_domain):
+                    keep_ans.append(rr)
+
+            else:
+                # No bailiwick constraint
+                keep_ans.append(rr)
+
+        # Keep NS and SOA in authority
+        for rr in resp.auth:
+            if rr.rtype in (QTYPE.NS, QTYPE.SOA):
+                keep_auth.append(rr)
+
+        # Only keep A records in additional that are in bailiwick
+        for rr in resp.ar:
+            if rr.rtype == QTYPE.A:
+                rname = str(rr.rname).rstrip('.').lower()
+                # Check if this A record is in bailiwick
+                if bailiwick_domain:
+                    if self.is_subdomain(rname, bailiwick_domain):
+                        keep_add.append(rr)
+                else:
+                    # keep all A records
+                    keep_add.append(rr)
+
+        resp.rr = keep_ans
+        resp.auth = keep_auth
+        resp.ar = keep_add
+        return resp
+
+    def run(self):
+        while True:
+            try:
+                ready = select.select([self.sock], [], [], 0.1)[0]
+                for s in ready:
+                    try:
+                        req, addr = self.recv_one()
+                        self.handle_query(req, addr)
+                    except Exception as e:
+                        self.log(f"Error in handling request: {e}")
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                self.log(f"Error in main loop: {e}")
+                import traceback
+                self.log(traceback.format_exc())
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()
